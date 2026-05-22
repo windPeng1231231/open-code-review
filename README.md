@@ -4,6 +4,8 @@ AI-powered code review CLI that reads Git diffs, sends changed files to a config
 
 The agent can read full file contents, search the codebase, inspect other changed files for context, and produce deep reviews — not just surface-level diff feedback.
 
+![Open Benchmark](imgs/open-benchmark.png)
+
 ## Install
 
 ### Via NPM (Recommended)
