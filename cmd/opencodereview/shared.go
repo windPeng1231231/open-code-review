@@ -18,6 +18,7 @@ import (
 	"github.com/open-code-review/open-code-review/internal/stdout"
 	"github.com/open-code-review/open-code-review/internal/telemetry"
 	"github.com/open-code-review/open-code-review/internal/tool"
+	"github.com/open-code-review/open-code-review/internal/vcs"
 )
 
 // commonContext bundles the state that both `ocr review` and `ocr scan`
@@ -30,9 +31,13 @@ type commonContext struct {
 	Resolver   rules.Resolver
 	FileFilter *rules.FileFilter
 	GitRunner  *gitcmd.Runner
+	// VCS is the detected (or forced) version-control backend for RepoDir.
+	// vcs.None means neither git nor svn was found (only possible on the
+	// scan path, which tolerates plain directories).
+	VCS vcs.Kind
 	// IsGitRepo reports whether RepoDir is inside a git repository. Always
-	// true when requireGit was set; may be false when scan accepts non-git
-	// directories.
+	// true when requireGit was set and the repo is git; may be false when
+	// scan accepts non-git directories or when the repo is svn.
 	IsGitRepo bool
 }
 
@@ -42,10 +47,13 @@ type commonContext struct {
 // the global git subprocess limiter. Both review and scan callers go
 // through this so the startup sequence stays consistent.
 //
-// requireGit=true fails fast when the directory is not a git repo (review
-// path: diff concept requires git). requireGit=false allows non-git
-// directories (scan path: provider falls back to filepath.Walk).
-func loadCommonContext(repoDirInput, rulePath string, maxTools, maxGitProcs int, requireGit bool) (*commonContext, error) {
+// requireGit=true fails fast when the directory is not a version-controlled
+// repo (review path: the diff concept requires git or svn). requireGit=false
+// allows plain directories (scan path: provider falls back to filepath.Walk).
+//
+// forcedVCS overrides auto-detection: vcs.None means "auto-detect", while
+// vcs.Git / vcs.SVN force that backend (from the --vcs flag).
+func loadCommonContext(repoDirInput, rulePath string, maxTools, maxGitProcs int, requireGit bool, forcedVCS vcs.Kind) (*commonContext, error) {
 	tpl, err := template.LoadDefault()
 	if err != nil {
 		return nil, fmt.Errorf("load default template: %w", err)
@@ -57,7 +65,7 @@ func loadCommonContext(repoDirInput, rulePath string, maxTools, maxGitProcs int,
 		return nil, fmt.Errorf("invalid config: %w", err)
 	}
 
-	repoDir, isGit, err := resolveWorkingDir(repoDirInput, requireGit)
+	repoDir, kind, err := resolveWorkingDir(repoDirInput, requireGit, forcedVCS)
 	if err != nil {
 		return nil, err
 	}
@@ -72,35 +80,42 @@ func loadCommonContext(repoDirInput, rulePath string, maxTools, maxGitProcs int,
 		RepoDir:    repoDir,
 		Resolver:   resolver,
 		FileFilter: fileFilter,
-		GitRunner:  gitcmd.New(maxGitProcs),
-		IsGitRepo:  isGit,
+		GitRunner:  gitcmd.NewWithBinary(kind.Binary(), maxGitProcs),
+		VCS:        kind,
+		IsGitRepo:  kind == vcs.Git,
 	}, nil
 }
 
-// resolveWorkingDir returns (absPath, isGitRepo, err). When requireGit is
-// true, returns an error if the directory is not a git repo. When false,
-// returns IsGitRepo=false instead of erroring (scan path uses this).
-func resolveWorkingDir(input string, requireGit bool) (string, bool, error) {
+// resolveWorkingDir returns (absPath, vcsKind, err). When requireVCS is true,
+// it errors if the directory is neither a git nor an svn working copy. When
+// false, it returns vcs.None instead of erroring (scan path uses this).
+//
+// forced overrides detection: vcs.None auto-detects; vcs.Git / vcs.SVN trust
+// the caller (the --vcs flag).
+func resolveWorkingDir(input string, requireVCS bool, forced vcs.Kind) (string, vcs.Kind, error) {
 	if input == "" {
 		wd, err := os.Getwd()
 		if err != nil {
-			return "", false, fmt.Errorf("get working directory: %w", err)
+			return "", vcs.None, fmt.Errorf("get working directory: %w", err)
 		}
 		input = wd
 	}
 	absPath, err := filepath.Abs(input)
 	if err != nil {
-		return "", false, fmt.Errorf("resolve absolute path: %w", err)
+		return "", vcs.None, fmt.Errorf("resolve absolute path: %w", err)
 	}
 	if _, statErr := os.Stat(absPath); statErr != nil {
-		return "", false, fmt.Errorf("stat %s: %w", absPath, statErr)
+		return "", vcs.None, fmt.Errorf("stat %s: %w", absPath, statErr)
 	}
-	out, err := runGitCmd(absPath, "rev-parse", "--git-dir")
-	isGit := err == nil && len(out) > 0
-	if !isGit && requireGit {
-		return "", false, fmt.Errorf("%s is not a git repository", absPath)
+
+	kind := forced
+	if kind == vcs.None {
+		kind = vcs.Detect(absPath)
 	}
-	return absPath, isGit, nil
+	if kind == vcs.None && requireVCS {
+		return "", vcs.None, fmt.Errorf("%s is not a git or svn repository", absPath)
+	}
+	return absPath, kind, nil
 }
 
 // llmRuntime bundles the LLM-side state both subcommands need once they've

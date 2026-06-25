@@ -13,6 +13,7 @@ import (
 
 	"github.com/open-code-review/open-code-review/internal/gitcmd"
 	"github.com/open-code-review/open-code-review/internal/pathutil"
+	"github.com/open-code-review/open-code-review/internal/vcs"
 )
 
 // ReviewMode represents the active review mode.
@@ -55,10 +56,22 @@ func (m ReviewMode) RefValue(toRef, commit string) (string, bool) {
 type FileReader struct {
 	RepoDir string
 	Mode    ReviewMode
-	// Ref is the git ref to use for ModeRange (--to) or ModeCommit (--commit).
-	// Empty for ModeWorkspace.
+	// Ref is the git ref / svn revision to use for ModeRange (--to) or
+	// ModeCommit (--commit). Empty for ModeWorkspace.
 	Ref    string
 	Runner *gitcmd.Runner
+	// VCS selects the backend used to read files at a ref. The zero value
+	// (vcs.None) behaves as git; vcs.SVN reads via `svn cat`.
+	VCS vcs.Kind
+}
+
+// refReadArgs builds the subcommand args to read path at fr.Ref for the
+// active VCS, plus the fallback executable name for the no-runner path.
+func (fr *FileReader) refReadArgs(path string) (args []string, fallbackBin string) {
+	if fr.VCS == vcs.SVN {
+		return []string{"cat", "-r", fr.Ref, path}, "svn"
+	}
+	return []string{"-c", "core.quotepath=false", "show", "--end-of-options", fr.Ref + ":" + path}, "git"
 }
 
 // Read returns the full content of a file path (relative to RepoDir),
@@ -116,20 +129,20 @@ func (fr *FileReader) readFromGitShow(parentCtx context.Context, path string) (s
 	ctx, cancel := context.WithTimeout(parentCtx, 30*time.Second)
 	defer cancel()
 
-	args := []string{"-c", "core.quotepath=false", "show", "--end-of-options", fr.Ref + ":" + path}
+	args, fallbackBin := fr.refReadArgs(path)
 	if fr.Runner != nil {
 		output, err := fr.Runner.Output(ctx, fr.RepoDir, args...)
 		if err != nil {
-			return "", fmt.Errorf("git show %s:%s: %w", fr.Ref, path, err)
+			return "", fmt.Errorf("read %s@%s: %w", path, fr.Ref, err)
 		}
 		return string(output), nil
 	}
 
-	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd := exec.CommandContext(ctx, fallbackBin, args...)
 	cmd.Dir = fr.RepoDir
 	output, err := cmd.Output()
 	if err != nil {
-		return "", fmt.Errorf("git show %s:%s: %w", fr.Ref, path, err)
+		return "", fmt.Errorf("read %s@%s: %w", path, fr.Ref, err)
 	}
 	return string(output), nil
 }
@@ -202,7 +215,7 @@ func (fr *FileReader) readLinesFromDisk(path string, startLine, maxLines int) ([
 }
 
 func (fr *FileReader) readLinesFromGitShow(ctx context.Context, path string, startLine, maxLines int) ([]string, int, error) {
-	args := []string{"-c", "core.quotepath=false", "show", "--end-of-options", fr.Ref + ":" + path}
+	args, fallbackBin := fr.refReadArgs(path)
 
 	var collected []string
 	var totalLines int
@@ -214,19 +227,19 @@ func (fr *FileReader) readLinesFromGitShow(ctx context.Context, path string, sta
 			return scanErr
 		}, args...)
 		if err != nil {
-			return nil, 0, fmt.Errorf("git show %s:%s: %w", fr.Ref, path, err)
+			return nil, 0, fmt.Errorf("read %s@%s: %w", path, fr.Ref, err)
 		}
 		return collected, totalLines, nil
 	}
 
-	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd := exec.CommandContext(ctx, fallbackBin, args...)
 	cmd.Dir = fr.RepoDir
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
-		return nil, 0, fmt.Errorf("git show %s:%s: %w", fr.Ref, path, err)
+		return nil, 0, fmt.Errorf("read %s@%s: %w", path, fr.Ref, err)
 	}
 	if err := cmd.Start(); err != nil {
-		return nil, 0, fmt.Errorf("git show %s:%s: %w", fr.Ref, path, err)
+		return nil, 0, fmt.Errorf("read %s@%s: %w", path, fr.Ref, err)
 	}
 
 	collected, totalLines, scanErr := scanLines(stdoutPipe, startLine, maxLines)
@@ -236,10 +249,10 @@ func (fr *FileReader) readLinesFromGitShow(ctx context.Context, path string, sta
 	waitErr := cmd.Wait()
 
 	if scanErr != nil {
-		return nil, 0, fmt.Errorf("git show %s:%s: %w", fr.Ref, path, scanErr)
+		return nil, 0, fmt.Errorf("read %s@%s: %w", path, fr.Ref, scanErr)
 	}
 	if waitErr != nil {
-		return nil, 0, fmt.Errorf("git show %s:%s: %w", fr.Ref, path, waitErr)
+		return nil, 0, fmt.Errorf("read %s@%s: %w", path, fr.Ref, waitErr)
 	}
 	return collected, totalLines, nil
 }

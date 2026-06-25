@@ -11,6 +11,7 @@ import (
 	"github.com/open-code-review/open-code-review/internal/agent"
 	"github.com/open-code-review/open-code-review/internal/telemetry"
 	"github.com/open-code-review/open-code-review/internal/tool"
+	"github.com/open-code-review/open-code-review/internal/vcs"
 )
 
 func runReview(args []string) error {
@@ -24,20 +25,26 @@ func runReview(args []string) error {
 		return nil
 	}
 
-	// review path: git repo is required (diff concepts depend on it).
-	cc, err := loadCommonContext(opts.repoDir, opts.rulePath, opts.maxTools, opts.maxGitProcs, true)
+	// Resolve the --vcs flag (auto|git|svn) into a forced backend kind.
+	forcedVCS, ok := vcs.ParseKind(opts.vcs)
+	if !ok {
+		return fmt.Errorf("invalid --vcs value %q: must be auto, git or svn", opts.vcs)
+	}
+
+	// review path: a VCS repo is required (diff concepts depend on it).
+	cc, err := loadCommonContext(opts.repoDir, opts.rulePath, opts.maxTools, opts.maxGitProcs, true, forcedVCS)
 	if err != nil {
 		return err
 	}
 	applyCLIExcludes(cc, splitPaths(opts.excludes))
 
-	// Security (#112): reject ref-option injection before any git invocation.
-	if err := validateReviewRefs(cc.RepoDir, opts); err != nil {
+	// Security (#112): reject ref-option injection before any VCS invocation.
+	if err := validateReviewRefs(cc.RepoDir, cc.VCS, opts); err != nil {
 		return err
 	}
 
 	if opts.commit != "" && opts.background == "" {
-		if msg, err := getCommitMessage(cc.RepoDir, opts.commit); err == nil && msg != "" {
+		if msg, err := getCommitMessage(cc.RepoDir, cc.VCS, opts.commit); err == nil && msg != "" {
 			opts.background = msg
 		}
 	}
@@ -58,6 +65,7 @@ func runReview(args []string) error {
 		Mode:    mode,
 		Ref:     ref,
 		Runner:  cc.GitRunner,
+		VCS:     cc.VCS,
 	}
 	tools := buildToolRegistry(rt.Collector, fileReader)
 
@@ -80,6 +88,8 @@ func runReview(args []string) error {
 		Model:                 rt.Model,
 		Background:            opts.background,
 		GitRunner:             cc.GitRunner,
+		VCS:                   cc.VCS,
+		SVNExternalsDepth:     opts.svnExtDepth,
 	})
 
 	// Silence progress output during execution; restored before the trace
@@ -133,8 +143,11 @@ func requireGitRepo(dir string) error {
 }
 
 // validateReviewRefs rejects ref-option injection (#112): any --from/--to/
-// --commit value must be a real commit ref and must not start with '-'.
-func validateReviewRefs(repoDir string, opts reviewOptions) error {
+// --commit value must be a real ref/revision and must not start with '-'.
+// Git refs are verified against the object database; svn revisions are
+// validated syntactically (numeric / keyword) — enough to block injection
+// without a server round-trip.
+func validateReviewRefs(repoDir string, kind vcs.Kind, opts reviewOptions) error {
 	refs := []struct {
 		flag string
 		ref  string
@@ -148,7 +161,13 @@ func validateReviewRefs(repoDir string, opts reviewOptions) error {
 			continue
 		}
 		if strings.HasPrefix(item.ref, "-") {
-			return fmt.Errorf("%s value %q is not a valid git ref: refs must not start with '-'", item.flag, item.ref)
+			return fmt.Errorf("%s value %q is not a valid ref: refs must not start with '-'", item.flag, item.ref)
+		}
+		if kind == vcs.SVN {
+			if !vcs.ValidRevision(item.ref) {
+				return fmt.Errorf("%s value %q is not a valid svn revision (use a number or HEAD/BASE/PREV/COMMITTED)", item.flag, item.ref)
+			}
+			continue
 		}
 		if out, err := runGitCmd(repoDir, "rev-parse", "--verify", "--end-of-options", item.ref+"^{commit}"); err != nil {
 			msg := strings.TrimSpace(string(out))
@@ -167,8 +186,10 @@ func runPreview(cc *commonContext, opts reviewOptions) error {
 		From:       opts.from,
 		To:         opts.to,
 		Commit:     opts.commit,
-		FileFilter: cc.FileFilter,
-		GitRunner:  cc.GitRunner,
+		FileFilter:        cc.FileFilter,
+		GitRunner:         cc.GitRunner,
+		VCS:               cc.VCS,
+		SVNExternalsDepth: opts.svnExtDepth,
 	})
 
 	preview, err := ag.Preview(context.Background())

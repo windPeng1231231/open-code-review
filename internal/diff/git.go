@@ -12,6 +12,7 @@ import (
 
 	"github.com/open-code-review/open-code-review/internal/gitcmd"
 	"github.com/open-code-review/open-code-review/internal/model"
+	"github.com/open-code-review/open-code-review/internal/vcs"
 )
 
 // DiffContextLines defines the number of context lines around each changed hunk.
@@ -42,11 +43,21 @@ const (
 	ModeRange                 // merge-base(from,to)..to
 )
 
-// Provider retrieves and parse git diffs from a repository.
+// Provider retrieves and parses diffs from a repository. It supports both git
+// and svn working copies; the svn path produces git-style unified diff text
+// (via vcs.NormalizeSVNDiff) so the shared parser stays VCS-agnostic.
 type Provider struct {
 	repoDir string
 	mode    Mode
 	runner  *gitcmd.Runner
+
+	// vcs selects the backend. The zero value (vcs.None) is treated as git.
+	vcs vcs.Kind
+
+	// svnExternalsDepth bounds discovery of nested svn working copies
+	// (externals) to aggregate into a root review. <=0 disables aggregation.
+	// Only meaningful when vcs == vcs.SVN.
+	svnExternalsDepth int
 
 	// Range mode parameters
 	from, to string // from/to refs for range comparison
@@ -55,6 +66,26 @@ type Provider struct {
 	commit string // single commit hash/ref
 
 	mergeBase string // cached common ancestor for range mode
+}
+
+// WithVCS sets the version-control backend for this Provider and returns it
+// for chaining. vcs.None / vcs.Git keep the git code path; vcs.SVN switches
+// diff retrieval to svn. Defaults to git when never called.
+//
+// svn nested-external aggregation is OFF by default for direct callers; enable
+// it with WithSVNExternalsDepth (the CLI passes its --svn-externals-depth flag,
+// which defaults to vcs.DefaultExternalsDepth).
+func (p *Provider) WithVCS(kind vcs.Kind) *Provider {
+	p.vcs = kind
+	return p
+}
+
+// WithSVNExternalsDepth sets how many directory levels to scan for nested svn
+// working copies (externals) to fold into a root review. A value <=0 disables
+// aggregation (review only the targeted working copy). Returns p for chaining.
+func (p *Provider) WithSVNExternalsDepth(depth int) *Provider {
+	p.svnExternalsDepth = depth
+	return p
 }
 
 // NewProvider creates a Provider for range mode: from..to (via merge-base).
@@ -108,6 +139,10 @@ func (p *Provider) MergeBase(ctx context.Context) string {
 
 // GetDiff returns all changes as parsed model.Diff structs.
 func (p *Provider) GetDiff(ctx context.Context) ([]model.Diff, error) {
+	if p.vcs == vcs.SVN {
+		return p.getDiffSVN(ctx)
+	}
+
 	var combined strings.Builder
 
 	switch p.mode {
@@ -334,6 +369,79 @@ func (p *Provider) runGit(ctx context.Context, args ...string) (string, error) {
 	}
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = p.repoDir
+	out, err := cmd.CombinedOutput()
+	return string(out), err
+}
+
+// ---- SVN support ----
+
+// getDiffSVN retrieves and parses changes from a Subversion working copy.
+// It maps the three review modes onto svn diff invocations, normalizes the
+// output into git unified-diff form, then reuses the shared parser.
+//
+// Mode mapping:
+//   - ModeWorkspace: `svn diff`            (local versioned changes vs BASE)
+//   - ModeCommit:    `svn diff -c REV`     (changes introduced by revision REV)
+//   - ModeRange:     `svn diff -r A:B`     (literal revision interval; svn has
+//     no merge-base / DAG, so the range is taken verbatim)
+//
+// Unlike git's workspace mode, svn workspace review intentionally does NOT
+// synthesize diffs for unversioned ("?") files: in svn those are typically
+// build artifacts or tooling output, not changes staged for commit. `svn diff`
+// already covers added/modified/deleted versioned items.
+func (p *Provider) getDiffSVN(ctx context.Context) ([]model.Diff, error) {
+	var args []string
+	var ref string
+	switch p.mode {
+	case ModeRange:
+		args = []string{"diff", "-r", p.from + ":" + p.to}
+		ref = p.to
+	case ModeCommit:
+		args = []string{"diff", "-c", p.commit}
+		ref = p.commit
+	default: // ModeWorkspace
+		args = []string{"diff"}
+		ref = "" // read new content from the working tree
+	}
+
+	// Main working copy.
+	raw, err := p.runSVNIn(ctx, p.repoDir, args...)
+	if err != nil {
+		return nil, fmt.Errorf("svn diff failed: %w", err)
+	}
+	var combined strings.Builder
+	combined.WriteString(vcs.NormalizeSVNDiff(raw))
+
+	// Aggregate nested working copies (svn externals / separate checkouts):
+	// svn diff does NOT descend into externals, so a root review would miss
+	// their changes. We run the same diff in each nested working copy and
+	// prefix its paths with the copy's path relative to the root, producing a
+	// single unified review across all of them.
+	for _, sub := range vcs.DiscoverNestedWorkingCopies(p.repoDir, p.svnExternalsDepth) {
+		subAbs := filepath.Join(p.repoDir, filepath.FromSlash(sub))
+		subRaw, subErr := p.runSVNIn(ctx, subAbs, args...)
+		if subErr != nil {
+			fmt.Fprintf(os.Stderr, "[ocr] WARNING: svn diff failed in external %q: %v\n", sub, subErr)
+			continue
+		}
+		combined.WriteString(vcs.NormalizeSVNDiffPrefixed(subRaw, sub))
+	}
+
+	diffs, err := ParseDiffTextVCS(ctx, combined.String(), p.repoDir, ref, p.runner, vcs.SVN)
+	if err != nil {
+		return nil, err
+	}
+	return p.filterDiffs(diffs), nil
+}
+
+// runSVNIn executes an svn subcommand in dir, preferring the shared
+// concurrency-limited runner and falling back to a direct exec.
+func (p *Provider) runSVNIn(ctx context.Context, dir string, args ...string) (string, error) {
+	if p.runner != nil {
+		return p.runner.Run(ctx, dir, args...)
+	}
+	cmd := exec.CommandContext(ctx, "svn", args...)
+	cmd.Dir = dir
 	out, err := cmd.CombinedOutput()
 	return string(out), err
 }

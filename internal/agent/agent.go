@@ -21,6 +21,7 @@ import (
 	"github.com/open-code-review/open-code-review/internal/stdout"
 	"github.com/open-code-review/open-code-review/internal/telemetry"
 	"github.com/open-code-review/open-code-review/internal/tool"
+	"github.com/open-code-review/open-code-review/internal/vcs"
 )
 
 // AgentWarning is re-exported from llmloop for backwards compatibility with
@@ -106,6 +107,15 @@ type Args struct {
 	// GitRunner limits the total number of concurrent git subprocesses.
 	// When nil, subprocesses are spawned without a global limit.
 	GitRunner *gitcmd.Runner
+
+	// VCS selects the version-control backend (git or svn). The zero value
+	// (vcs.None) is treated as git.
+	VCS vcs.Kind
+
+	// SVNExternalsDepth bounds discovery of nested svn working copies
+	// (externals) folded into a root svn review. <=0 disables aggregation.
+	// Ignored for git.
+	SVNExternalsDepth int
 
 	// Session is an optional session history instance for collecting conversation records.
 	// When nil, a default one is created automatically with git branch auto-detected from repoDir.
@@ -275,6 +285,10 @@ func (a *Agent) loadDiffs(ctx context.Context) error {
 		provider = diff.NewProvider(a.args.RepoDir, a.args.From, a.args.To, a.args.GitRunner)
 	default:
 		provider = diff.NewWorkspaceProvider(a.args.RepoDir, a.args.GitRunner)
+	}
+	provider.WithVCS(a.args.VCS)
+	if a.args.VCS == vcs.SVN {
+		provider.WithSVNExternalsDepth(a.args.SVNExternalsDepth)
 	}
 
 	parsed, err := provider.GetDiff(ctx)

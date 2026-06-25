@@ -3,10 +3,12 @@ package main
 import (
 	"strings"
 	"testing"
+
+	"github.com/open-code-review/open-code-review/internal/vcs"
 )
 
 func TestValidateReviewRefsRejectsOptionLikeCommit(t *testing.T) {
-	err := validateReviewRefs(t.TempDir(), reviewOptions{commit: "-O./pwn.sh"})
+	err := validateReviewRefs(t.TempDir(), vcs.Git, reviewOptions{commit: "-O./pwn.sh"})
 	if err == nil {
 		t.Fatal("expected option-like --commit ref to be rejected")
 	}
@@ -16,12 +18,30 @@ func TestValidateReviewRefsRejectsOptionLikeCommit(t *testing.T) {
 }
 
 func TestValidateReviewRefsRejectsOptionLikeRangeRef(t *testing.T) {
-	err := validateReviewRefs(t.TempDir(), reviewOptions{to: "-O./pwn.sh"})
+	err := validateReviewRefs(t.TempDir(), vcs.Git, reviewOptions{to: "-O./pwn.sh"})
 	if err == nil {
 		t.Fatal("expected option-like --to ref to be rejected")
 	}
 	if !strings.Contains(err.Error(), "--to") || !strings.Contains(err.Error(), "must not start with '-'") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestValidateReviewRefsSVNRejectsNonNumeric(t *testing.T) {
+	err := validateReviewRefs(t.TempDir(), vcs.SVN, reviewOptions{commit: "deadbeef"})
+	if err == nil {
+		t.Fatal("expected non-numeric svn revision to be rejected")
+	}
+	if !strings.Contains(err.Error(), "svn revision") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestValidateReviewRefsSVNAcceptsNumericAndKeyword(t *testing.T) {
+	for _, rev := range []string{"793876", "HEAD"} {
+		if err := validateReviewRefs(t.TempDir(), vcs.SVN, reviewOptions{commit: rev}); err != nil {
+			t.Fatalf("svn revision %q should be valid, got: %v", rev, err)
+		}
 	}
 }
 

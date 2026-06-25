@@ -11,6 +11,7 @@ import (
 	"github.com/open-code-review/open-code-review/internal/scan"
 	"github.com/open-code-review/open-code-review/internal/telemetry"
 	"github.com/open-code-review/open-code-review/internal/tool"
+	"github.com/open-code-review/open-code-review/internal/vcs"
 )
 
 // scanOptions mirrors reviewOptions for the full-scan subcommand. The two
@@ -119,8 +120,9 @@ func runScan(args []string) error {
 	}
 
 	// scan path: git is preferred (more accurate .gitignore handling) but not required;
-	// provider falls back to filepath.Walk when the dir is not a git repo.
-	cc, err := loadCommonContext(opts.repoDir, opts.rulePath, opts.maxTools, opts.maxGitProcs, false)
+	// provider falls back to filepath.Walk for svn / non-VCS directories.
+	// vcs.None ⇒ auto-detect the backend.
+	cc, err := loadCommonContext(opts.repoDir, opts.rulePath, opts.maxTools, opts.maxGitProcs, false, vcs.None)
 	if err != nil {
 		return err
 	}

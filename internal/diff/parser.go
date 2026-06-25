@@ -12,6 +12,7 @@ import (
 
 	"github.com/open-code-review/open-code-review/internal/gitcmd"
 	"github.com/open-code-review/open-code-review/internal/model"
+	"github.com/open-code-review/open-code-review/internal/vcs"
 )
 
 var (
@@ -25,6 +26,14 @@ var (
 // runner, if non-nil, is used to execute git subprocesses through a
 // shared concurrency limiter.
 func ParseDiffText(ctx context.Context, diffText string, repoDir string, ref string, runner *gitcmd.Runner) ([]model.Diff, error) {
+	return ParseDiffTextVCS(ctx, diffText, repoDir, ref, runner, vcs.Git)
+}
+
+// ParseDiffTextVCS is ParseDiffText with an explicit VCS backend. When kind is
+// vcs.SVN and ref is non-empty, new-file content is read with `svn cat -r REV`
+// instead of `git show REV:path`. The diffText itself must already be in git
+// unified-diff form (svn callers normalize via vcs.NormalizeSVNDiff first).
+func ParseDiffTextVCS(ctx context.Context, diffText string, repoDir string, ref string, runner *gitcmd.Runner, kind vcs.Kind) ([]model.Diff, error) {
 	lines := strings.Split(diffText, "\n")
 	var diffs []model.Diff
 	var current *model.Diff
@@ -38,7 +47,7 @@ func ParseDiffText(ctx context.Context, diffText string, repoDir string, ref str
 			// Flush previous diff
 			if current != nil {
 				current.Diff = strings.TrimSuffix(buf.String(), "\n")
-				finalizeDiff(ctx, current, repoDir, ref, runner)
+				finalizeDiff(ctx, current, repoDir, ref, runner, kind)
 				diffs = append(diffs, *current)
 				buf.Reset()
 			}
@@ -85,28 +94,47 @@ func ParseDiffText(ctx context.Context, diffText string, repoDir string, ref str
 	// Flush last diff
 	if current != nil {
 		current.Diff = strings.TrimSuffix(buf.String(), "\n")
-		finalizeDiff(ctx, current, repoDir, ref, runner)
+		finalizeDiff(ctx, current, repoDir, ref, runner, kind)
 		diffs = append(diffs, *current)
 	}
 
 	return diffs, nil
 }
 
-// finalizeDiff reads the new file content. When ref is non-empty it uses
-// git show to read the file at that ref; otherwise it reads from disk.
-func finalizeDiff(ctx context.Context, d *model.Diff, repoDir string, ref string, runner *gitcmd.Runner) {
+// finalizeDiff reads the new file content. When ref is non-empty it reads the
+// file at that ref/revision (git show, or svn cat for vcs.SVN); otherwise it
+// reads from the working tree on disk.
+func finalizeDiff(ctx context.Context, d *model.Diff, repoDir string, ref string, runner *gitcmd.Runner, kind vcs.Kind) {
 	if d.IsDeleted || d.NewPath == "/dev/null" {
 		d.NewPath = "/dev/null"
 		return
 	}
+	// Binary files are always excluded from review (ExcludeBinary takes
+	// precedence over every other rule, including user --include), so reading
+	// their content is wasted work — and for svn the read often fails (e.g.
+	// `svn cat` on art assets that svn diff could only mark "Cannot display"),
+	// producing noisy WARNINGs. Skip it. Note we do NOT skip by unsupported
+	// extension here: a user --include rule can re-enable review of an
+	// otherwise-unsupported extension, and that path still needs its content.
+	if d.IsBinary {
+		return
+	}
 	if ref != "" {
-		args := []string{"-c", "core.quotepath=false", "show", "--end-of-options", ref + ":" + d.NewPath}
+		var args []string
+		fallbackBin := "git"
+		if kind == vcs.SVN {
+			// svn cat -r REV <path>, path is working-copy-relative.
+			args = []string{"cat", "-r", ref, d.NewPath}
+			fallbackBin = "svn"
+		} else {
+			args = []string{"-c", "core.quotepath=false", "show", "--end-of-options", ref + ":" + d.NewPath}
+		}
 		var output []byte
 		var err error
 		if runner != nil {
 			output, err = runner.Output(ctx, repoDir, args...)
 		} else {
-			cmd := exec.CommandContext(ctx, "git", args...)
+			cmd := exec.CommandContext(ctx, fallbackBin, args...)
 			cmd.Dir = repoDir
 			output, err = cmd.Output()
 		}

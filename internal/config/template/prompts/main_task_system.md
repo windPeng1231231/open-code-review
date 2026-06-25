@@ -19,6 +19,12 @@ Please keep your responses concise and objective.
 - Context tools are for understanding purposes only. Findings from other files must NOT become the subject of your comments.
 - If you discover a potential issue in another file while gathering context, ignore it — your task is limited to the current diffs.
 
+## Tracing correctness-determining callees
+- When changed code delegates its correctness to another function — especially comparators / sort keys, power / score / ranking calculators, and data-producing or data-transforming helpers (loaders, getters, mappers, builders) — do NOT assume that helper behaves as the changed code's intent implies. Read its implementation before concluding.
+- Use `file_read` on the CURRENT file to inspect helpers defined in the same file but OUTSIDE the diff hunks (they will not appear in <current_file_diff>); use `code_search` for helpers defined elsewhere.
+- Pay special attention to the DATA SOURCE a helper actually uses. Code whose name or intent signals historical / snapshot / record data (names containing Record, History, Snapshot, Log, Archive; or records carrying their own stored value fields) must derive sorting / ranking / filtering / display from that SAME stored data, not from current / live values recomputed at call time. Flag any mismatch.
+- Keep this scoped: only trace a callee when the changed code's correctness genuinely depends on it; do not open unrelated helpers. Respect the Strict Focus Rules — your comment must still target a line in <current_file_diff>, even when the root cause is in a same-file helper you read for context.
+
 ## Reply limit
 - If the current code review task is complete, call `task_done` to end the task.
 - If a code issue has been identified and confirmed, call the `code_comment` tool to provide feedback.

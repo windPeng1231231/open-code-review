@@ -106,6 +106,8 @@ type reviewOptions struct {
 	audience       string // --audience: "human" (default) or "agent"
 	background     string // --background: optional requirement context
 	model          string // --model: override resolved LLM model for this review
+	vcs            string // --vcs: version-control backend (auto|git|svn)
+	svnExtDepth    int    // --svn-externals-depth: nested svn WC scan depth (<=0 disables)
 	concurrency    int
 	perFileTimeout int
 	maxTools       int
@@ -132,6 +134,8 @@ func parseReviewFlags(args []string) (reviewOptions, error) {
 	a.StringVar(&opts.audience, "audience", "human", "output audience: human (show progress) or agent (summary only)")
 	a.StringVarP(&opts.background, "background", "b", "", "optional requirement/business context for the review")
 	a.StringVar(&opts.model, "model", "", "override LLM model for this review (e.g., claude-opus-4-6)")
+	a.StringVar(&opts.vcs, "vcs", "auto", "version-control backend: auto (detect), git, or svn")
+	a.IntVar(&opts.svnExtDepth, "svn-externals-depth", 4, "svn only: directory depth to scan for nested working copies (externals) to fold into a root review; 0 disables")
 	a.IntVar(&opts.maxTools, "max-tools", 0, "max tool call rounds per file (0 = template default; min 10)")
 	a.IntVar(&opts.maxGitProcs, "max-git-procs", 16, "max concurrent git subprocesses")
 	a.BoolVarP(&opts.preview, "preview", "p", false, "preview which files will be reviewed without running the LLM")
@@ -203,6 +207,12 @@ Examples:
   ocr review --commit abc123
   ocr review -c abc123
 
+  # Review an SVN working copy (auto-detected; revisions instead of refs)
+  ocr review                       # uncommitted local changes (svn diff)
+  ocr review --commit 793876       # one revision (svn diff -c 793876)
+  ocr review --from 793800 --to 793876   # revision range (svn diff -r A:B)
+  ocr review --vcs svn             # force the svn backend
+
   # Output JSON format
   ocr review --format json
   ocr review -f json
@@ -229,7 +239,8 @@ Flags:
   --rule string           path to JSON file with system review rules
   --timeout int           concurrent task timeout in minutes (default 10)
   --to string             target ref to end diff at (e.g., 'feature-branch')
-  --tools string          path to JSON tools config file (default: embedded)`)
+  --tools string          path to JSON tools config file (default: embedded)
+  --vcs string            version-control backend: auto (detect), git, or svn (default "auto")`)
 }
 
 // --- config subcommand ---
